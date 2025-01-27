@@ -37,7 +37,7 @@ class DependencyGraphTestCase(unittest.TestCase):
                 {"id": "test_provides1", "type": "constraint", "grouping": 0},
                 {"id": "test_provides2", "type": "constraint", "grouping": 0},
             ],
-            "links": [
+            "edges": [
                 {"source": "test_depends1", "target": 1},
                 {"source": "test_depends2", "target": 1},
                 {"source": 1, "target": "test_provides1"},
@@ -76,7 +76,7 @@ class DependencyGraphTestCase(unittest.TestCase):
                 {"id": "test_provides1", "type": "constraint", "grouping": 0},
                 {"id": "test_provides2", "type": "constraint", "grouping": 0},
             ],
-            "links": [
+            "edges": [
                 {"source": "test_depends1", "target": 1},
                 {"source": "test_depends2", "target": 1},
                 {"source": "test_depends1", "target": 6},
@@ -116,7 +116,7 @@ class DependencyGraphTestCase(unittest.TestCase):
                 {"id": "test_provides1", "type": "constraint", "grouping": 0},
                 {"id": "test_provides2", "type": "constraint", "grouping": 0},
             ],
-            "links": [
+            "edges": [
                 {"source": "test_depends1", "target": 1},
                 {"source": 1, "target": "test_provides1"},
                 {"source": 4, "target": "test_provides2"},
@@ -194,7 +194,7 @@ class DependencyGraphTestCase(unittest.TestCase):
                 {"id": 1, "type": "entity", "grouping": 0},
                 {"id": "test_depends_cycler", "type": "constraint", "grouping": 0},
             ],
-            "links": [
+            "edges": [
                 {"source": "test_depends_cycler", "target": 1},
                 {"source": 1, "target": "test_depends_cycler"},
             ],
@@ -223,7 +223,7 @@ class DependencyGraphTestCase(unittest.TestCase):
                 {"id": "test_depends_cycler", "type": "constraint", "grouping": 0},
                 {"id": "test_provides_cycler", "type": "constraint", "grouping": 0},
             ],
-            "links": [
+            "edges": [
                 {"source": "test_depends_cycler", "target": 1},
                 {"source": 1, "target": "test_provides_cycler"},
                 {"source": "test_provides_cycler", "target": 4},
@@ -256,7 +256,7 @@ class DependencyGraphTestCase(unittest.TestCase):
                 {"id": "c1", "type": "constraint", "grouping": 0},
                 {"id": "c2", "type": "constraint", "grouping": 0},
             ],
-            "links": [
+            "edges": [
                 {"source": 1, "target": "c1"},
                 {"source": "c1", "target": 3},
                 {"source": 3, "target": "c2"},
@@ -291,7 +291,7 @@ class DependencyGraphTestCase(unittest.TestCase):
                 {"id": "c2", "type": "constraint", "grouping": 0},
                 {"id": "c3", "type": "constraint", "grouping": 0},
             ],
-            "links": [
+            "edges": [
                 {"source": 1, "target": "c1"},
                 {"source": "c1", "target": 3},
                 {"source": 3, "target": "c2"},
@@ -328,7 +328,7 @@ class DependencyGraphTestCase(unittest.TestCase):
                 {"id": "c3", "type": "constraint", "grouping": 0},
                 {"id": "c4", "type": "constraint", "grouping": 0},
             ],
-            "links": [
+            "edges": [
                 {"source": 1, "target": "c1"},
                 {"source": "c1", "target": 4},
                 {"source": 4, "target": "c2"},
@@ -362,7 +362,7 @@ class DependencyGraphTestCase(unittest.TestCase):
                 {"id": "test_depends_cycler", "type": "constraint", "grouping": 0},
                 {"id": "test_provides_cycler", "type": "constraint", "grouping": 0},
             ],
-            "links": [
+            "edges": [
                 {"source": "test_depends_cycler", "target": 1},
                 {"source": 1, "target": "test_provides_cycler"},
                 {"source": "test_provides_cycler", "target": 4},
@@ -430,7 +430,7 @@ class DependencyGraphTestCase(unittest.TestCase):
                 {"id": 13, "type": "entity", "grouping": 0},
                 {"id": 14, "type": "entity", "grouping": 0},
             ],
-            "links": [
+            "edges": [
                 {"source": 1, "target": "c1"},
                 {"source": "c1", "target": 3},
                 {"source": 3, "target": "c2"},
