@@ -208,7 +208,7 @@ class DependencyGraph:
     def get_graph_json(self):
         """
         Return a JSON formatted string representation of the graph. The
-        representation is based on the D3 nodes-links format with links
+        representation is based on the D3 nodes-edges format with edges
         referencing node ID rather than list position.
 
         Returns:
