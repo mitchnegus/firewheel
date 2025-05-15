@@ -75,7 +75,7 @@ dependencies = [
 
 [project.optional-dependencies]
 mcs = [
-    "firewheel-repo-base",
+    "firewheel_repo_base@git+https://github.com/mitchnegus/firewheel_repo_base.git#egg=test-ci-build",
 ]
 format = [
     "ruff==0.11.2",
