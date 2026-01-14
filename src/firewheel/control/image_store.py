@@ -17,3 +17,12 @@ class ImageStore(FileStore):
                 this FileStore. Defaults to True.
         """
         super().__init__(store=store, decompress=decompress)
+
+    def add_file(self, path: str, force: bool = True) -> bool:
+        """Add an image file to the :py:class:`FileStore <firewheel.lib.minimega.file_store.FileStore>`.
+
+        Args:
+            path (str): The path of the file being transferred.
+            force (bool): Whether to force adding the new image.
+        """
+        super().add_image_file(path, force=force)

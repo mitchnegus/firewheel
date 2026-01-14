@@ -562,7 +562,7 @@ class ModelComponent:
         update_cache_task_id = self.image_cache_progress.add_task(
             description=f"{action} {image_path}"
         )
-        self.image_store.add_image_file(Path(self.path, image_path))
+        self.image_store.add_file(Path(self.path, image_path))
         self.image_cache_progress.stop_task(update_cache_task_id)
 
     @staticmethod
