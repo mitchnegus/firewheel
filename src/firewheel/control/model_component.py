@@ -1,7 +1,10 @@
 import os
+import enum
 import pprint
+from abc import ABC, abstractmethod
 from pathlib import Path
 from datetime import datetime
+from itertools import chain
 
 import yaml
 from rich.live import Live
@@ -25,6 +28,102 @@ from firewheel.control.model_component_exceptions import (
 )
 from firewheel.control.model_component_path_iterator import ModelComponentPathIterator
 from firewheel.vm_resource_manager.vm_resource_store import VmResourceStore
+
+
+class _BinaryFile(ABC):
+    """An abstract base class representing a generic (cacheable) file object."""
+
+    def __init__(self, path, file_store):
+        """
+        Instantiate the object representing a binary file.
+
+        Args:
+            path (pathlib.Path): The path to the binary file.
+            file_store (firewheel.lib.minimega.file_store.FileStore): A
+                file store object that will serve as the destination for
+                the file.
+        """
+        self.path = path
+        self.file_store = file_store
+        self.file_store_status = None
+        self._verify_existence()
+
+    @property
+    def name(self):
+        return self.path.name
+
+    @property
+    def size(self):
+        # Size of the file in bytes
+        return self.path.stat().st_size
+
+    @property
+    def modification_timestamp(self):
+        return datetime.utcfromtimestamp(self.path.stat().st_mtime)
+
+    @property
+    def requires_upload(self):
+        self.update_file_store_status()
+        return self.file_store_status in (
+            _FileStoreStatus.MISSING,
+            _FileStoreStatus.OUTDATED,
+        )
+
+    def _verify_existence(self):
+        if not self.path.exists():
+            self._handle_missing_file()
+
+    @abstractmethod
+    def _handle_missing_file(self):
+        raise NotImplementedError
+
+    def _determine_file_store_status(self):
+        # Exit immediately if the file has not yet been uploaded
+        if (store_timestamp := self.file_store.get_file_upload_date(self.name)) is None:
+            return _FileStoreStatus.MISSING
+        # The file exists in the store, so we must compare the two files
+        store_hash = self.file_store.get_file_hash(self.name)
+        binary_hash = hash_file(self.path)
+        if store_hash and store_hash == binary_hash:
+            return _FileStoreStatus.CURRENT
+        elif store_timestamp < self.modification_timestamp:
+            return _FileStoreStatus.OUTDATED
+        return _FileStoreStatus.UKNOWN
+
+    def update_file_store_status(self):
+        """Update the binary's status based on its availability in the file store."""
+        self.file_store_status = self._determine_file_store_status()
+
+    def upload(self):
+        """Upload the binary file to the file store."""
+        self.file_store.add_file(self.path)
+
+
+class _Image(_BinaryFile):
+    """A binary file object representing a VM image."""
+
+    def _handle_missing_file(self):
+        raise MissingVmResourceError(self.path)
+
+
+class _VMResource(_BinaryFile):
+    """A binary file object representing a VM resource."""
+
+    def _handle_missing_file(self):
+        # The image does not exist. This is a problem... unless the image is already
+        # in the file store then it may or may not be an issue. Either way, it is
+        # weird and the user should fix it.
+        raise MissingImageError(
+            f"The image {self.path} is not present in the model component."
+        )
+
+
+class _FileStoreStatus(enum.Enum):
+    """An enumeration of file statuses that may be assigned to files in a file store."""
+
+    CURRENT = enum.auto()
+    OUTDATED = enum.auto()
+    MISSING = enum.auto()
 
 
 class ModelComponent:
@@ -120,20 +219,20 @@ class ModelComponent:
         self.log = Log(name="ModelComponent").log
 
         # Set progress bars for this MC
-        self.overall_image_cache_progress = Progress(
+        self.overall_cache_progress = Progress(
             MofNCompleteColumn(),
             SpinnerColumn(spinner_name="line"),
             TextColumn(
-                "[yellow]Populating/refreshing the image cache for MC "
+                "[yellow]Populating/refreshing the caches for MC "
                 f"`[white]{name}`[/white]. This may take a while..."
             ),
         )
-        self.image_cache_progress = Progress(
+        self.large_file_cache_progress = Progress(
             TimeElapsedColumn(),
             TextColumn("[yellow]- {task.description}"),
         )
-        self.image_cache_progress_group = Group(
-            self.overall_image_cache_progress, self.image_cache_progress
+        self.cache_progress_group = Group(
+            self.overall_cache_progress, self.large_file_cache_progress
         )
 
     def _load_manifest(self, path):
@@ -326,281 +425,108 @@ class ModelComponent:
         """
         Upload any VM Resources and Images needed for the experiment to the cache.
         """
-        self._upload_vm_resources()
-        self._upload_images()
+        files = self._collect_vm_resources() + self._collect_images()
+        file_uploads = [file for file in files if file.requires_upload]
+        with Live(self.cache_progress_group):
+            overall_task_id = self.overall_cache_progress.add_task(
+                "", total=len(file_uploads)
+            )
+            for file in file_uploads:
+                if file.size > 100_000_000:  # 100 MB
+                    self._upload_large_file(file)
+                else:
+                    file.upload()
+            self.overall_cache_progress.update(overall_task_id, advance=1)
 
-    def _upload_vm_resource(self, resource):
+    def _upload_large_file(self, file):
+        """Upload a large file to the cache, including progress displays."""
+        is_outdated = file.file_store_status == _FileStoreStatus.OUTDATED
+        action = "Updating" if is_outdated else "Adding"
+        update_cache_task_id = self.large_file_cache_progress.add_task(
+            description=f"{action} large file: `{file.path}`"
+        )
+        file.upload()
+        self.large_file_cache_progress.stop_task(update_cache_task_id)
+
+    def _collect_vm_resources(self):
         """
-        Upload a file to the :py:class:`VmResourceStore
-        <firewheel.vm_resource_manager.vm_resource_store.VmResourceStore>`.
-        It interrupts the path of the VM resources in the following way:
+        Collect all VM resources from the manifest.
 
-        * Non-recursive all dir's files: ``path_to_dir``,
-          ``path_to_dir/``, or ``path_to_dir/*``
-        * Non-recursive all dir's files matching pattern: ``path_to_dir/*.ext``
-        * Recursive all files: ``path_to_dir/**``, ``path_to_dir/**/``, or
-          ``path_to_dir/**/*``
-        * Recursive  all files matching pattern: ``path_to_dir/**/*.ext``
+        Returns:
+            list: A list of VM resource objects determined from the manifest.
+        """
+        if (vm_resource_list := self.manifest.get("vm_resources")) is None:
+            return
+        elif not isinstance(vm_resource_list, list):
+            # The `vm_resources` must be in a list
+            raise RuntimeError(
+                "Malformed MANIFEST, the `vm_resources` attribute must be a list. "
+                f"It is currently: `{vm_resource_list}` of type "
+                f"`{type(vm_resource_list)}`."
+            )
+
+        vm_resource_names = chain.from_iterable(
+            self._interpret_manifest_vmr_specification(manifest_vm_resource)
+            for manifest_vm_resource in vm_resource_list
+        )
+        return [
+            _VMResource(Path(self.path, vmr_name), self.vm_resource_store)
+            for vmr_name in vm_resource_names
+        ]
+
+    def _interpret_manifest_vmr_specification(self, manifest_vm_resource):
+        """
+        Interpret a specified VM resource string provided in a manifest file.
 
         Args:
-            resource (str): Path relative to this component's root to the file being
-                            uploaded.
+            manifest_vm_resource (str): A string specifyin a VM resource, VM
+                resource directory, or collection of VM resources according to
+                a pattern.
 
-        Returns:
-            str: Indication of what happened. This may be one of:
-                ``no_date`` -- There was no upload date for the given file in the
-                    ``VmResourceStore``. It was uploaded.
-                ``new_hash`` -- The modified time of the file on disk differs from the
-                    last upload time in the ``VmResourceStore`` and the hashes did not
-                    match. File was uploaded.
-                ``same_hash`` -- The file on disk was modified after the upload time in
-                    the ``VmResourceStore`` but the hashes are the same. File was not
-                    uploaded.
-                :py:data:`False` -- None of the other conditions occurred. For example,
-                    the file on disk was modified before the ``VmResourceStore`` upload
-                    time.
-        """
-        path = Path(self.path, resource)
-        self._verify_vmr_exists(path)
+        Notes:
+            This method interprets the path of the VM resources in the following way:
 
-        modification_timestamp = self._get_modification_timestamp(path)
-        self.log.debug(
-            "Resource %s in %s has modified time of %s",
-            resource,
-            self.manifest["name"],
-            modification_timestamp,
-        )
-        upload_date = self.vm_resource_store.get_file_upload_date(Path(resource).name)
-        self.log.debug("VM Resource store file has upload date of %s", upload_date)
-
-        if upload_date is None:
-            self.log.debug(
-                "Resource %s not found in store. Uploading.", os.path.basename(resource)
-            )
-            self.vm_resource_store.add_file(path)
-            return "no_date"
-
-        if modification_timestamp != upload_date:
-            self.log.debug("Resource on disk is different from store. Checksumming.")
-            resource_hash = hash_file(path)
-            store_hash = self.vm_resource_store.get_file_hash(resource)
-            self.log.debug(
-                "Resource %s//%s on disk has hash %s and in store has %s",
-                self.manifest["name"],
-                resource,
-                resource_hash,
-                store_hash,
-            )
-
-            if resource_hash != store_hash:
-                self.log.debug("Newer resource checksum differs. Uploading.")
-                self.vm_resource_store.add_file(path)
-                return "new_hash"
-            return "same_hash"
-        return False
-
-    def _upload_vm_resources(self):
-        """
-        Upload all VM resources from the manifest. It interrupts the path
-        of the VM resources in the following way:
-
-        * Non-recursive all dir's files: ``path_to_dir``,
-          ``path_to_dir/``, or ``path_to_dir/*``
-        * Non-recursive all dir's files matching pattern: ``path_to_dir/*.ext``
-        * Recursive all files: ``path_to_dir/**``, ``path_to_dir/**/``, or
-          ``path_to_dir/**/*``
-        * Recursive  all files matching pattern: ``path_to_dir/**/*.ext``
-
-        Returns:
-            bool: :py:data:`True` if any resource was uploaded, :py:data:`False`
-                otherwise.
+            * Non-recursively upload all directory files: ``path_to_dir``,
+              ``path_to_dir/``, or ``path_to_dir/*`` (all equivalent)
+            * Non-recursively upload all directory files matching a pattern: ``path_to_dir/*.ext``
+            * Recursively upload all files: ``path_to_dir/**``, ``path_to_dir/**/``, or
+              ``path_to_dir/**/*`` (all equivalent)
+            * Recursively upload all files matching a pattern: ``path_to_dir/**/*.ext``
 
         Raises:
             RuntimeError: If the ``vm_resources`` field in the MANIFEST is not a list.
         """
-        if (vm_resources := self.manifest.get("vm_resources")) is None:
-            return False
-        elif not isinstance(vm_resources, list):
-            # The `vm_resources` must be in a list
-            raise RuntimeError(
-                'Malformed MANIFEST, the "vm_resources" attribute must be a list. '
-                f"It is currently: `{vm_resources}` of type `{type(vm_resources)}`."
-            )
+        if Path(self.path).joinpath(manifest_vm_resource).is_dir():
+            manifest_vm_resource += "/*"
 
-        any_uploaded = False
+        # replace all ** not already followed by **/* with **/*
+        manifest_vm_resource = manifest_vm_resource.replace("**/*", "**")
+        manifest_vm_resource = manifest_vm_resource.replace("**", "**/*")
+        if "*" in manifest_vm_resource:
+            enumerated_resources = [
+                str(p.relative_to(self.path))
+                for p in Path(self.path).glob(manifest_vm_resource)
+                if p.is_file()
+            ]
+        else:
+            enumerated_resources = [manifest_vm_resource]
+        return enumerated_resources
 
-        # Interpret path as follows:
-        # Non-recursive, all dir's files, non-recursive: path_to_dir, path_to_dir/ -> path_to_dir/*
-        # Non-recursive, all dir's files matching pattern path_to_dir/*.ext -> no change
-        # Recursive - all files: path_to_dir/**, path_to_dir/**/ -> path_to_dir/**/*
-        # Recursive - all files matching pattern: path_to_dir/**/*.ext -> no change
-        for manifest_vm_resource in vm_resources:
-            if Path(self.path).joinpath(manifest_vm_resource).is_dir():
-                manifest_vm_resource += "/*"
-
-            # replace all ** not already followed by **/* with **/*
-            manifest_vm_resource = manifest_vm_resource.replace("**/*", "**")
-            manifest_vm_resource = manifest_vm_resource.replace("**", "**/*")
-            if "*" in manifest_vm_resource:
-                enumerated_resources = [
-                    str(p.relative_to(self.path))
-                    for p in Path(self.path).glob(manifest_vm_resource)
-                    if p.is_file()
-                ]
-            else:
-                enumerated_resources = [manifest_vm_resource]
-            for resource in enumerated_resources:
-                self.log.debug(
-                    "Uploading resource %s from model component %s",
-                    resource,
-                    self.manifest["name"],
-                )
-                result = self._upload_vm_resource(resource)
-                if result == "same_hash":
-                    result = False
-                any_uploaded = any_uploaded or bool(result)
-        return any_uploaded
-
-    def _upload_images(self):
+    def _collect_images(self):
         """
-        Upload all image files from the manifest.
+        Collect all images from the manifest.
 
         Returns:
-            dict: Statuses for each specified file. Possible statuses are:
-
-            * ``no_date`` -- There was no upload date for the given file in the
-                  :py:class:`ImageStore <firewheel.control.image_store.ImageStore>`.
-                  It was uploaded.
-            * ``new_hash`` -- The modified time of the file on disk differs from the
-                  last upload time in the :py:class:`ImageStore <firewheel.control.image_store.ImageStore>`
-                  and the hashes did not match. File was uploaded.
-            * ``same_hash`` -- The file on disk was modified after the upload time in
-                  the :py:class:`ImageStore <firewheel.control.image_store.ImageStore>`
-                  but the hashes are the same. File was not uploaded.
-            * :py:data:`False` -- None of the other conditions occurred. For example,
-                  the file on disk was modified before the :py:class:`ImageStore
-                  <firewheel.control.image_store.ImageStore>` upload time.
-
-            An empty dictionary is returned if no images are identified.
-
+            list: A list of image objects determined from the manifest.
         """
-        image_statuses = {
-            image_path: self._evaluate_image(image_path)
-            for image_field in self.manifest.get("images", {})
-            for image_path in image_field.get("paths", [])
-        }
-        if image_actions := self._determine_image_actions(image_statuses):
-            with Live(self.image_cache_progress_group):
-                overall_task_id = self.overall_image_cache_progress.add_task(
-                    "", total=len(image_actions)
-                )
-                for image_path, action in image_actions.items():
-                    self._upload_image(image_path, action=action)
-                    self.overall_image_cache_progress.update(overall_task_id, advance=1)
-        return image_statuses
-
-    def _evaluate_image(self, image_path):
-        """
-        Evaluate an image's status.
-
-        Perform an evaluation of the image's status. The result will govern
-        uploads to the :py:class:`ImageStore <firewheel.control.image_store.ImageStore>`).
-
-        Args:
-            image_path (str): A path to an image to be evaluated.
-
-        Returns:
-            str: A status for the specified image file. Possible statuses are:
-
-            * ``no_date`` -- There was no upload date for the given file in the
-                  :py:class:`ImageStore <firewheel.control.image_store.ImageStore>`.
-            * ``new_hash`` -- The modified time of the file on disk differs from the
-                  last upload time in the :py:class:`ImageStore <firewheel.control.image_store.ImageStore>`
-                  and the hashes did not match.
-            * ``same_hash`` -- The file on disk was modified after the upload time in
-                  the :py:class:`ImageStore <firewheel.control.image_store.ImageStore>`
-                  but the hashes are the same.
-            * :py:data:`False` -- None of the other conditions occurred. For example,
-                  the file on disk was modified before the :py:class:`ImageStore
-                  <firewheel.control.image_store.ImageStore>` upload time.
-        """
-        path = Path(self.path, image_path)
-        self._verify_image_exists(path)
-
-        modification_timestamp = self._get_modification_timestamp(path)
-        upload_date = self.image_store.get_file_upload_date(path.name)
-
-        if upload_date is None:
-            return "no_date"
-        elif modification_timestamp != upload_date:
-            # The timestamps do not match; compare the hashes
-            disk_hash = hash_file(path)
-            store_hash = self.image_store.get_file_hash(os.path.basename(path))
-            return "same_hash" if disk_hash == store_hash else "new_hash"
-        return False
-
-    def _determine_image_actions(self, image_statuses):
-        # Determine (and filter) images that require uploads
-        return {
-            image_path: "Adding" if status == "no_date" else "Updating"
-            for image_path, status in image_statuses.items()
-            if status in {"no_date", "new_hash"}
-        }
-
-    def _upload_image(self, image_path, action="Adding"):
-        """
-        Upload an image to the `ImageStore <firewheel.control.image_store.ImageStore>`.
-
-        Inspect the status of the image status and perform an upload to the
-        `ImageStore <firewheel.control.image_store.ImageStore>` accordingly.
-
-        Args:
-            image_path (str): A path to an image to be added to the `ImageStore
-            <firewheel.control.image_store.ImageStore>`.
-            action (str): The action being performed on the image.
-        """
-        update_cache_task_id = self.image_cache_progress.add_task(
-            description=f"{action} {image_path}"
+        architecture_image_data = self.manifest.get("images", {})
+        image_relative_paths = chain.from_iterable(
+            info.get("paths", []) for info in architecture_image_data
         )
-        self.image_store.add_file(Path(self.path, image_path))
-        self.image_cache_progress.stop_task(update_cache_task_id)
-
-    @staticmethod
-    def _verify_vmr_exists(vmr_path):
-        """
-        Verify that the VM resource exists in the model component.
-
-        Args:
-            vmr_path (path): The path to the VM resource to verify.
-
-        Raises:
-            MissingVmResourceError: If the given file path does not exist.
-        """
-        if not vmr_path.exists():
-            raise MissingVmResourceError(vmr_path)
-
-    @staticmethod
-    def _verify_image_exists(image_path):
-        """
-        Verify that the image exists in the model component.
-
-        Args:
-            image_path (path): The path to the image to verify.
-
-        Raises:
-            MissingImageError: If the image is not found in the model component.
-        """
-        if not image_path.exists():
-            # The image does not exist. This is a problem... unless the image is already
-            # in the file store then it may or may not be an issue. Either way, it is
-            # weird and the user should fix it.
-            raise MissingImageError(
-                f"The image {image_path} is not present in the model component."
-            )
-
-    @staticmethod
-    def _get_modification_timestamp(path):
-        return datetime.utcfromtimestamp(path.stat().st_mtime)
+        return [
+            _Image(Path(self.path, image_path), self.image_store)
+            for image_path in image_relative_paths
+        ]
 
     def set_dependency_graph_id(self, new_id):
         """
